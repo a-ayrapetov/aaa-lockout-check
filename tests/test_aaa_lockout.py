@@ -8,6 +8,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import aaa_lockout as a  # noqa: E402
 
+SRC_PLACEHOLDER = "<interface-with-the-address-ISE-knows>"
+
 BASE = """hostname unit-sw1
 aaa new-model
 username breakglass privilege 15 secret 9 $9$unitfixturehash
@@ -50,9 +52,9 @@ def test_legacy_ios15_config_is_safe():
 
 def test_dangerous_config_hits_high_rules():
     high = rules("danger-sw1", "high")
-    for rule in ("L01", "L02", "L03", "L04", "L05", "L07", "L08", "L10", "L12", "L14"):
+    for rule in ("L02", "L03", "L04", "L05", "L07", "L08", "L10", "L12", "L14"):
         assert rule in high, rule
-    assert {"L06", "L13"} <= rules("danger-sw1", "medium")
+    assert {"L01", "L06", "L13"} <= rules("danger-sw1", "medium")
     assert "L15" in rules("danger-sw1", "low")
 
 
@@ -64,10 +66,11 @@ def test_device_is_the_hostname():
 def test_mgmt_vrf_mismatch_is_high():
     l11 = [x for x in findings("mgmt-vrf-bad") if x.rule == "L11"]
     assert len(l11) == 1 and l11[0].severity == "high"
-    assert "Mgmt-vrf" in l11[0].title and "server-private" in l11[0].title
-    assert " ip vrf forwarding Mgmt-vrf" in l11[0].fix.splitlines()
-    assert " server-private 192.0.2.10 key <key>" in l11[0].fix.splitlines()
-    assert "replies never come back" in l11[0].why
+    assert "no 'ip vrf forwarding Mgmt-vrf'" in l11[0].title
+    # the fix adds the VRF and source to the group and leaves the working server name entries alone
+    assert l11[0].fix.splitlines() == ["aaa group server tacacs+ TACACS-ADMIN", " ip vrf forwarding Mgmt-vrf",
+                                       " ip tacacs source-interface GigabitEthernet0/0"]
+    assert "replies never come back" in l11[0].why and "every login waits on a timeout" in l11[0].why
 
 
 def test_mgmt_vrf_fixed_twin_is_clean():
@@ -82,10 +85,12 @@ def test_no_aaa_gives_one_low_line():
 
 # Single rules
 
-def test_l01_password_only_user_is_weak():
+def test_l01_password_only_user_is_medium_and_no_user_is_high():
     text = "aaa new-model\nusername admin privilege 15 password 0 UnitFixturePw01\n"
     f = hits(text, "L01")
-    assert f and f[0].severity == "high" and "UnitFixturePw01" not in f[0].evidence
+    assert f and f[0].severity == "medium" and "UnitFixturePw01" not in f[0].evidence
+    assert "still works as the fallback" in f[0].why and "'secret'" in f[0].why
+    assert hits("aaa new-model\n", "L01")[0].severity == "high"
     assert not hits(BASE, "L01")
 
 
@@ -95,6 +100,34 @@ def test_l02_local_first_or_last_is_fine_and_why_explains_error_vs_fail():
     f = hits(BASE + TAC + "aaa authentication login default group TAC\n", "L02")
     assert f[0].severity == "high" and f[0].fix == "aaa authentication login default group TAC local"
     assert "ERROR" in f[0].why and "FAIL" in f[0].why
+
+
+def test_l02_enable_fallback_without_enable_secret_is_high():
+    f = [x for x in findings("l02-enable") if x.severity != "low"]
+    assert [(x.rule, x.severity) for x in f] == [("L02", "high")]
+    assert "no enable secret or enable password" in f[0].title
+    assert f[0].fix == "aaa authentication login default group TAC local"
+    with_pw = BASE + TAC + "aaa authentication login default group TAC enable\n"
+    assert not hits(with_pw, "L02")
+
+
+def test_l02_line_fallback_without_line_password_is_high():
+    f = [x for x in findings("l02-line") if x.severity != "low"]
+    assert [(x.rule, x.severity) for x in f] == [("L02", "high")]
+    assert "'line'" in f[0].title and f[0].fix == "aaa authentication login default group TAC local"
+    every_line = BASE + TAC + ("aaa authentication login default group TAC line\n"
+                               "line con 0\n password 7 UnitFixtureLinePw1\nline vty 0 4\n password 7 UnitFixtureLinePw2\n")
+    assert not hits(every_line, "L02")
+    one_missing = every_line.replace(" password 7 UnitFixtureLinePw2\n", "")
+    assert hits(one_missing, "L02")[0].severity == "high"
+
+
+def test_l02_none_is_medium_and_fix_replaces_none_with_local():
+    f = [x for x in findings("l02-none") if x.severity != "low"]
+    assert [(x.rule, x.severity) for x in f] == [("L02", "medium")]
+    assert "ends in none" in f[0].title and f[0].fix == "aaa authentication login default group TAC local"
+    assert hits(BASE + TAC + "aaa authentication login default group TAC local none\n", "L02")[0].fix == \
+        "aaa authentication login default group TAC local"
 
 
 def test_l02_unbound_named_list_is_medium_and_bound_is_high():
@@ -152,8 +185,14 @@ def test_l10_source_interface_missing_shut_or_without_address():
     assert "shut down" in hits(shut, "L10")[0].title
     noip = BASE.replace(" ip address 198.51.100.50 255.255.255.0", " no ip address") + TAC
     assert "no IP address" in hits(noip, "L10")[0].title
+    assert SRC_PLACEHOLDER in hits(shut, "L10")[0].fix and SRC_PLACEHOLDER in hits(noip, "L10")[0].fix
     missing = BASE + TAC.replace("Vlan100", "Vlan200")
-    assert "not in this config" in hits(missing, "L10")[0].title
+    f = hits(missing, "L10")
+    assert "not in this config" in f[0].title
+    # point the source at the closest interface that exists and has an address; never create a new SVI
+    assert f[0].fix.splitlines() == ["aaa group server tacacs+ TAC", " ip tacacs source-interface Vlan100"]
+    assert hits(BASE + "ip tacacs source-interface Vlan200\n", "L10")[0].fix == "ip tacacs source-interface Vlan100"
+    assert not any(x.fix.startswith("interface ") for x in findings("danger-sw1") if x.rule == "L10")
     abbreviated = BASE + TAC.replace("source-interface Vlan100", "source-interface Vl100")
     assert not hits(abbreviated, "L10")
 
@@ -165,6 +204,35 @@ def test_l11_server_private_without_vrf_shows_redacted_key():
     assert "key 7 <redacted>" in f[0].evidence and "UnitFixtureKey0123" not in f[0].evidence
 
 
+def test_l11_server_name_with_matching_vrf_is_fine():
+    text = (BASE.replace(" ip address", " vrf forwarding MGMT\n ip address") + "vrf definition MGMT\n"
+            "aaa group server tacacs+ TAC\n server name T1\n ip vrf forwarding MGMT\n"
+            " ip tacacs source-interface Vlan100\n"
+            "tacacs server T1\n address ipv4 192.0.2.10\n key 7 UnitFixtureKey0555\n")
+    assert not hits(text, "L11")
+    assert [x for x in findings("mgmt-vrf-fixed") if x.rule == "L11"] == []
+
+
+def test_l11_legacy_global_servers_in_a_vrf_group():
+    text = (BASE.replace(" ip address", " vrf forwarding MGMT\n ip address") + "vrf definition MGMT\n"
+            "tacacs-server host 192.0.2.10 key 7 UnitFixtureKey0666\n"
+            "aaa group server tacacs+ TAC\n server 192.0.2.10\n ip vrf forwarding MGMT\n"
+            " ip tacacs source-interface Vlan100\n")
+    f = hits(text, "L11")
+    assert f and "legacy global-table servers" in f[0].title
+    assert " server-private 192.0.2.10 key <key>" in f[0].fix.splitlines()
+
+
+def test_l11_reverse_mismatch_suggests_an_interface_in_the_vrf():
+    text = (BASE + "vrf definition MGMT\ninterface GigabitEthernet0/0\n vrf forwarding MGMT\n"
+            " ip address 203.0.113.5 255.255.255.0\n"
+            "aaa group server tacacs+ TAC\n server-private 192.0.2.10 key 7 UnitFixtureKey0777\n"
+            " ip vrf forwarding MGMT\n ip tacacs source-interface Vlan100\n")
+    f = hits(text, "L11")
+    assert "global table" in f[0].title
+    assert f[0].fix.splitlines() == ["aaa group server tacacs+ TAC", " ip tacacs source-interface GigabitEthernet0/0"]
+
+
 def test_l11_builtin_tacacs_cannot_follow_a_vrf():
     text = (BASE.replace(" ip address", " vrf forwarding MGMT\n ip address") + "vrf definition MGMT\n"
             "ip tacacs source-interface Vlan100\ntacacs-server host 192.0.2.10 key 7 UnitFixtureKey0999\n"
@@ -173,10 +241,13 @@ def test_l11_builtin_tacacs_cannot_follow_a_vrf():
     assert f and "built-in group tacacs+" in f[0].title
 
 
-def test_l12_vrf_not_defined():
-    f = hits(BASE + TAC + "aaa group server tacacs+ TAC2\n server-private 192.0.2.11 key 7 X1\n"
-             " ip vrf forwarding NOPE\n", "L12")
-    assert f[0].severity == "high"
+def test_l12_vrf_not_defined_suggests_an_existing_vrf_never_a_new_one():
+    group = "aaa group server tacacs+ TAC2\n server-private 192.0.2.11 key 7 X1\n ip vrf forwarding Mgmt-vfr\n"
+    f = hits(BASE + TAC + group, "L12")
+    assert f[0].severity == "high" and f[0].fix.endswith(" ip vrf forwarding <existing-mgmt-vrf>")
+    f = hits(BASE + TAC + "vrf definition Mgmt-vrf\n" + group, "L12")
+    assert f[0].fix.splitlines() == ["aaa group server tacacs+ TAC2", " ip vrf forwarding Mgmt-vrf"]
+    assert not any("vrf definition" in x.fix for x in findings("danger-sw1"))
 
 
 def test_l13_missing_keys_and_global_key_covers_legacy_hosts():

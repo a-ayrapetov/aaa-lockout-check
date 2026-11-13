@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/a-ayrapetov/aaa-lockout-check/actions/workflows/ci.yml/badge.svg)](https://github.com/a-ayrapetov/aaa-lockout-check/actions/workflows/ci.yml)
 
-Offline lockout check for Cisco IOS and IOS-XE AAA config. Before you bind TACACS+ (or RADIUS) device administration on a switch, point it at the saved running-config and it answers one question: will this config lock me out? Per device you get every risk with severity, the evidence line, why it matters in one sentence and the exact lines that fix it.
+Offline lockout check for Cisco IOS and IOS-XE AAA config. Before you bind TACACS+ device administration on a switch (the method list rules L02 to L08 also read RADIUS lists; the source interface, VRF and key checks are TACACS+ only), point it at the saved running-config and it answers one question: will this config lock me out? Per device you get every risk with severity, the evidence line, why it matters in one sentence and the exact lines that fix it.
 
 ```bash
 pip install git+https://github.com/a-ayrapetov/aaa-lockout-check
@@ -14,8 +14,8 @@ aaa-lockout-check sw1.cfg
 | ID | Severity | Check |
 |---|---|---|
 | L00 | low | AAA not enabled: nothing here can lock you out yet; this check matters once you enable it |
-| L01 | high | `aaa new-model` on and no local user stored with `secret` (a `password`-only user counts as weak) |
-| L02 | high | login list on a line or the default list has a server group and no `local`, `local-case`, `enable` or `line` method |
+| L01 | high / medium | `aaa new-model` on and no local user at all (high); only local users stored with `password` (medium: they still work as the fallback, but type 0 and 7 are reversible, so store the break-glass account with `secret`) |
+| L02 | high / medium | login list on a line or the default list has a server group and no fallback that works during an outage: `local` or `local-case`; `enable` only when an enable secret or enable password exists; `line` only when every console and vty line has a password (high). A list ending in `none` lets anyone in while the servers are down (medium) |
 | L03 | high | exec authorization list on a vty line or the default list has a server group and no `local` or `if-authenticated` |
 | L04 | high | command authorization list has a server group and no `local` or `if-authenticated` |
 | L05 | high | `aaa authorization console` together with server-group exec or command authorization |
@@ -24,13 +24,13 @@ aaa-lockout-check sw1.cfg
 | L08 | high | line binds `login authentication`, `authorization exec` or `authorization commands` to a list that is not defined |
 | L09 | medium | no `ip tacacs source-interface` anywhere |
 | L10 | high | TACACS+ source interface missing from the config, shut down, or without an IP address |
-| L11 | high | source interface in VRF V but the server group has no `ip vrf forwarding V`, or uses `server name` or global servers instead of `server-private` |
+| L11 | high | source interface in VRF V but the server group has no `ip vrf forwarding V` (or the group forwards into a VRF the source is not in), or a VRF group points at legacy global-table servers (`server <ip>` or built-in `group tacacs+`). `server name` with a matching `ip vrf forwarding` is a working config and is not flagged |
 | L12 | high | server group has `ip vrf forwarding V` and V is not defined |
 | L13 | medium | TACACS+ server (legacy host, named server or `server-private`) without a key |
 | L14 | medium / high | enable list with a server group and no `enable` fallback (medium), or with `enable` fallback and neither `enable secret` nor `enable password` (high) |
 | L15 | low | no command accounting to a server group |
 
-L02, L03 and L04 report a named list that no line uses yet as medium, because binding it as written is the lockout. L07 on an accounting line is medium, because it costs you the audit trail, not the login. Run `aaa-lockout-check --explain` for one line per rule on why it matters.
+L02, L03 and L04 report a named list that no line uses yet as medium, because binding it as written is the lockout. L07 on an accounting line is medium, because it costs you the audit trail, not the login. Fix lines point at what already exists: the closest interface that has an address, or the closest VRF that is defined. They never create a new SVI or an empty VRF, and they never strip working server entries. Run `aaa-lockout-check --explain` for one line per rule on why it matters.
 
 How fallback works on Cisco: the next method in a list is tried only when the one before it returns an ERROR, which means no server in the group replied. When a server answers FAIL (wrong password, user not on the server, policy says no) the attempt ends there. So `local` at the end of a list protects you from an outage. It does not protect you from a wrong password or a user missing on the server.
 

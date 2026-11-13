@@ -2,12 +2,13 @@
 """
 aaa-lockout-check: offline lockout check of Cisco IOS / IOS-XE AAA configuration.
 
-Answers one question before you bind TACACS+ (or RADIUS) device administration
-on a switch: will this config lock me out? Feed it saved running-configs (one or
-many files) and get a per-device findings list with severity, the evidence line,
-why it matters and the exact fix lines. Pure text parsing, standard library only,
-never connects to a device. Keys, secrets and passwords are redacted from every
-output.
+Before you bind TACACS+ device administration on a switch (the method list rules
+L02 to L08 also read RADIUS lists; the source interface, VRF and key checks are
+TACACS+ only), it answers one question: will this config lock me out? Feed it
+saved running-configs (one or many files) and get a per-device findings list with
+severity, the evidence line, why it matters and the exact fix lines. Pure text
+parsing, standard library only, never connects to a device. Keys, secrets and
+passwords are redacted from every output.
 
 Cisco syntax and defaults vary by release and this tool only reads text, so
 confirm each finding against the device's version before acting on it.
@@ -39,11 +40,13 @@ class Finding:
 # Rule ID -> (severity as shown by --explain, why it matters in one sentence)
 RULES = {
     "L00": ("low", "AAA not enabled: nothing here can lock you out yet; this check matters once you enable it."),
-    "L01": ("high", "With aaa new-model on and no local user stored as a secret, there is no local identity to "
-                    "fall back to when the policy servers are out of reach."),
-    "L02": ("high", "IOS tries the next login method only when the server group returns an ERROR (no server "
-                    "replies), not when a server answers FAIL, so local last saves you from an outage but not from "
-                    "a wrong password or a user missing on the server, and without it an outage locks everyone out."),
+    "L01": ("high / medium", "With aaa new-model on and no local user there is nothing to fall back to when the "
+                             "policy servers are out of reach (high); a user stored with 'password' still works as "
+                             "the fallback but type 0 and 7 are reversible (medium)."),
+    "L02": ("high / medium", "IOS tries the next login method only when the server group returns an ERROR (no server "
+                             "replies), not when a server answers FAIL, so local last saves you from an outage but "
+                             "not from a wrong password or a user missing on the server, and without a working "
+                             "fallback an outage locks everyone out; a list ending in none lets anyone in (medium)."),
     "L03": ("high", "Exec authorization against a server group with no local or if-authenticated fallback refuses "
                     "every session while the servers are unreachable, even after a good local login."),
     "L04": ("high", "Command authorization against a server group with no local or if-authenticated fallback "
@@ -63,20 +66,20 @@ RULES = {
                       "it must match the device entry on the server, or the server treats it as an unknown device."),
     "L10": ("high", "The TACACS+ source interface is missing, shut down or has no IP address, so requests cannot "
                     "leave from the address the policy server knows."),
-    "L11": ("high", "The source interface is in a VRF the server group does not forward into (or the group uses "
-                    "server name or global servers instead of server-private), so requests leave in one routing "
-                    "table and replies never come back: packets sent, nothing received, and a 1 to 5 second delay "
-                    "per command."),
+    "L11": ("high", "The source interface is in a VRF the server group does not forward into (or the reverse), or "
+                    "the group points at legacy global-table servers, so requests leave in one routing table and "
+                    "replies never come back: packets sent, nothing received, and every login waits on a timeout "
+                    "of a few seconds before it falls back, and with command authorization on, so does every "
+                    "command."),
     "L12": ("high", "The server group forwards into a VRF this config does not define, so there is no routing "
                     "table behind it."),
     "L13": ("medium", "A TACACS+ server entry without a key does not share a secret with the policy server, so the "
                       "server rejects or ignores its requests."),
-    "L14": ("medium", "With no enable method after the server group nobody reaches privileged mode while the "
+    "L14": ("medium / high", "With no enable method after the server group nobody reaches privileged mode while the "
                       "servers are down; with the enable method but no enable secret, that fallback cannot succeed."),
     "L15": ("low", "Without command accounting to a server group there is no audit trail of who typed what."),
 }
 
-LOGIN_FALLBACK = ("local", "local-case", "enable", "line", "none")
 AUTHZ_FALLBACK = ("local", "if-authenticated", "none")
 BUILTIN_GROUPS = ("tacacs+", "radius")
 SEV_ORDER = {"high": 0, "medium": 1, "low": 2}
@@ -91,6 +94,17 @@ def redact(line: str) -> str:
 
 def evidence(*lines) -> str:
     return " | ".join(redact(l) for l in lines if l) or "not found in config"
+
+
+SRC_PLACEHOLDER = "<interface-with-the-address-ISE-knows>"
+
+
+def near_or(name, candidates, placeholder):
+    """Closest existing name to suggest in a fix (first candidate when name is None), else a placeholder."""
+    if name is None:
+        return candidates[0] if candidates else placeholder
+    hit = difflib.get_close_matches(name, candidates, n=1, cutoff=0.5)
+    return hit[0] if hit else placeholder
 
 
 def blocks(lines, header_re):
@@ -236,8 +250,10 @@ class Config:
         self.lines = []
         for m, body in blocks(lines, r"^line (con|console|vty)\b"):
             ln = {"hdr": m.string.strip(), "kind": "con" if m.group(1).startswith("con") else "vty",
-                  "login": None, "exec": None, "cmds": {}}
+                  "login": None, "exec": None, "cmds": {}, "password": False}
             for b in body:
+                if re.match(r"^password\s+\S", b):
+                    ln["password"] = True
                 x = re.match(r"^login authentication (\S+)", b)
                 if x:
                     ln["login"] = x.group(1)
@@ -266,14 +282,25 @@ class Config:
     def tacacs_groups(self):
         return {n: g for n, g in self.groups.items() if g["type"] == "tacacs+"}
 
-    def server_ips(self, group):
-        """Server addresses a TACACS+ group reaches, as far as the text tells."""
-        if group is None:  # built-in group tacacs+
-            ips = [first_ip(h) for h in self.tac_hosts] + [s["addr"] for s in self.tac_named.values()]
-        else:
-            ips = [first_ip(p) for p in group["private"]] + [first_ip(s) for s in group["servers"]]
-            ips += [self.tac_named.get(n, {}).get("addr") for n, _ in group["names"]]
-        return [ip for ip in ips if ip] or ["<server-ip>"]
+    def live_interfaces(self, vrf=None, any_vrf=True):
+        """Interfaces that are up (not shut down) and have an IP address, optionally only those in one VRF."""
+        return [k for k, v in self.intfs.items() if v["ip"] and not v["shut"] and (any_vrf or v["vrf"] == vrf)]
+
+
+def login_fallback_ok(c, meths) -> bool:
+    """True when a login list has a fallback that can let someone in while the servers are unreachable.
+
+    local and local-case always count; enable only when an enable secret or enable password exists; line only
+    when every console and vty line has a password. none is reported on its own (no lockout, no credentials).
+    """
+    for m in meths:
+        if m in ("local", "local-case"):
+            return True
+        if m == "enable" and (c.enable_secret or c.enable_password):
+            return True
+        if m == "line" and c.lines and all(ln["password"] for ln in c.lines):
+            return True
+    return False
 
 
 def audit_config(name: str, text: str) -> list:
@@ -297,22 +324,63 @@ def audit_config(name: str, text: str) -> list:
     console_lines = con if c.console_authz else []
 
     # L01: a local identity to fall back to
-    if not any(kind == "secret" for _, kind, _ in c.users):
+    breakglass = ["username <breakglass-user> privilege 15 algorithm-type scrypt secret <secret>"]
+    if not c.users:
+        add("L01", "high", "No local user at all", "username not found in config", breakglass)
+    elif not any(kind == "secret" for _, kind, _ in c.users):
         weak = [l for _, kind, l in c.users if kind == "password"]
-        add("L01", "high",
-            "Only password-type local users, no local user with a secret" if weak else "No local user with a secret",
-            evidence(*weak[:3]),
-            ["username <breakglass-user> privilege 15 algorithm-type scrypt secret <secret>"])
+        if weak:
+            add("L01", "medium", "Only password-type local users, no local user with a secret", evidence(*weak[:3]),
+                breakglass, "A local user stored with 'password' still works as the fallback, but type 0 and 7 are "
+                            "reversible; store the break-glass account with 'secret'.")
+        else:
+            add("L01", "medium", "No local user with a secret or a password",
+                evidence(*[l for _, _, l in c.users][:3]), breakglass,
+                "The local users here have neither a secret nor a password, so they are no dependable fallback; "
+                "store the break-glass account with 'secret'.")
 
-    # L02: login lists with a server group and no local-type fallback
+    # L02: login lists with a server group and no fallback that can work during an outage
     login_live = {"default"} | {ln["login"] for ln in c.lines if ln["login"]}
     for lname, (meths, line) in c.login.items():
-        if groups_in(meths) and not any(m in LOGIN_FALLBACK for m in meths):
-            live = lname in login_live
-            add("L02", "high" if live else "medium",
-                f"Login list '{lname}' has no local fallback after the server group"
-                + ("" if live else " (not bound to a line yet; binding it as written locks you out in an outage)"),
-                evidence(line), [f"aaa authentication login {lname} {' '.join(meths)} local"])
+        if not groups_in(meths):
+            continue
+        live = lname in login_live
+        unbound = "" if live else " (not bound to a line yet; binding it as written locks you out in an outage)"
+        if "none" in meths:
+            has_local = any(m in ("local", "local-case") for m in meths)
+            fixed = [m for m in meths if m != "none"] if has_local else ["local" if m == "none" else m for m in meths]
+            add("L02", "medium", f"Login list '{lname}' ends in none: no credentials needed while the servers are down",
+                evidence(line), [f"aaa authentication login {lname} {' '.join(fixed)}"],
+                "With none after the server group anyone gets in without a password whenever the servers stop "
+                "replying; local keeps a way in during an outage and still asks for credentials.")
+        elif not login_fallback_ok(c, meths):
+            broken = [m for m in meths if m in ("enable", "line")]
+            fixed, put = [], False
+            for m in meths:
+                if m in ("enable", "line"):
+                    if not put:
+                        fixed.append("local")
+                        put = True
+                else:
+                    fixed.append(m)
+            if not put:
+                fixed.append("local")
+            if not broken:
+                title = f"Login list '{lname}' has no local fallback after the server group"
+                why = ("IOS tries the next login method only when the server group returns an ERROR (no server "
+                       "replies), not when a server answers FAIL, so local last saves you from an outage but not "
+                       "from a wrong password or a user missing on the server, and without it an outage locks "
+                       "everyone out.")
+            elif broken[0] == "enable":
+                title = f"Login list '{lname}' falls back to 'enable' but there is no enable secret or enable password"
+                why = ("IOS reaches the enable method only when no server replies, and with no enable secret or "
+                       "enable password it has nothing to check, so an outage locks everyone out.")
+            else:
+                title = f"Login list '{lname}' falls back to 'line' but not every console and vty line has a password"
+                why = ("IOS reaches the line method only when no server replies, and a line without a password has "
+                       "nothing to check, so an outage locks everyone out of that line.")
+            add("L02", "high" if live else "medium", title + unbound, evidence(line),
+                [f"aaa authentication login {lname} {' '.join(fixed)}"], why)
 
     # L03: exec authorization without fallback
     exec_live = {"default"} | {ln["exec"] for ln in vty + console_lines if ln["exec"]}
@@ -417,22 +485,24 @@ def audit_config(name: str, text: str) -> list:
     # L09 / L10 / L11: TACACS+ source interface and VRF
     tac_in_use = bool(tac_groups or c.tac_hosts or c.tac_named) or any(
         "tacacs+" in groups_in(parse_methods(l)) for l, _ in c.method_lines)
-    sources = ([("global", c.tac_src)] if c.tac_src else []) + \
-              [(f"group {n}", g["src"]) for n, g in tac_groups.items() if g["src"]]
+    sources = ([("global", None, c.tac_src)] if c.tac_src else []) + \
+              [(f"group {n}", g, g["src"]) for n, g in tac_groups.items() if g["src"]]
     if tac_in_use and not sources:
         add("L09", "medium", "No TACACS+ source interface set", "ip tacacs source-interface not found in config",
-            ["ip tacacs source-interface <mgmt-interface>"])
-    for where, (iname, line) in sources:
+            [f"ip tacacs source-interface {SRC_PLACEHOLDER}"])
+    for where, g, (iname, line) in sources:
         k = c.interface(iname)
         if k is None:
-            add("L10", "high", f"TACACS+ source interface {iname} ({where}) is not in this config", evidence(line),
-                [f"interface {iname}", " ip address <ip> <mask>", " no shutdown"])
+            title, ev = f"TACACS+ source interface {iname} ({where}) is not in this config", evidence(line)
         elif c.intfs[k]["shut"]:
-            add("L10", "high", f"TACACS+ source interface {k} ({where}) is shut down",
-                evidence(line, f"interface {k} | shutdown"), [f"interface {k}", " no shutdown"])
+            title, ev = f"TACACS+ source interface {k} ({where}) is shut down", evidence(line, f"interface {k} | shutdown")
         elif not c.intfs[k]["ip"]:
-            add("L10", "high", f"TACACS+ source interface {k} ({where}) has no IP address",
-                evidence(line, f"interface {k}"), [f"interface {k}", " ip address <ip> <mask>"])
+            title, ev = f"TACACS+ source interface {k} ({where}) has no IP address", evidence(line, f"interface {k}")
+        else:
+            continue
+        new = near_or(iname, [i for i in c.live_interfaces() if i != k], SRC_PLACEHOLDER)
+        fix = [f"ip tacacs source-interface {new}"] if g is None else [g["line"], f" ip tacacs source-interface {new}"]
+        add("L10", "high", title, ev, fix)
 
     # L11: each TACACS+ group (and the built-in group tacacs+ when used) against its source interface VRF
     vrf_checks = list(tac_groups.items())
@@ -445,37 +515,39 @@ def audit_config(name: str, text: str) -> list:
             continue  # L10 already covers a missing source interface
         svrf = c.intfs[intf]["vrf"] if intf else None
         gvrf = g["vrf"][0] if g and g["vrf"] else None
-        uses_global = bool(g and (g["names"] or g["servers"]))
-        problems = []
-        if svrf and svrf != gvrf:
-            problems.append(f"source {intf} is in VRF {svrf} but " + (
-                "the built-in group tacacs+ cannot forward into a VRF" if g is None else
-                f"group {gname} " + (f"forwards into VRF {gvrf}" if gvrf else f"has no 'ip vrf forwarding {svrf}'")))
-        elif gvrf and intf and not svrf:
-            problems.append(f"group {gname} forwards into VRF {gvrf} but source {intf} is in the global table")
-        if uses_global and (svrf or gvrf):
-            problems.append(f"group {gname} uses " + ("'server name'" if g["names"] else "global servers")
-                            + " instead of server-private")
+        problems, servers_fix, vrf_fix = [], [], []
+        if g is None:
+            if not svrf:
+                continue
+            problems.append(f"source {intf} is in VRF {svrf} but the built-in group tacacs+ uses global-table "
+                            "servers and cannot forward into a VRF")
+            servers_fix = [f" server name {n}" for n in c.tac_named] + \
+                          [f" server-private {first_ip(h) or '<server-ip>'} key <key>" for h in c.tac_hosts]
+            vrf_fix = [f" ip vrf forwarding {svrf}", f" ip tacacs source-interface {intf}"]
+        else:
+            if svrf and svrf != gvrf:
+                problems.append(f"source {intf} is in VRF {svrf} but group {gname} " + (
+                    f"forwards into VRF {gvrf}" if gvrf else f"has no 'ip vrf forwarding {svrf}'"))
+                vrf_fix = [f" ip vrf forwarding {svrf}", f" ip tacacs source-interface {intf}"]
+            elif gvrf and intf and not svrf:
+                problems.append(f"group {gname} forwards into VRF {gvrf} but source {intf} is in the global table")
+                vrf_fix = [f" ip tacacs source-interface "
+                           f"{near_or(None, c.live_interfaces(gvrf, any_vrf=False), '<interface-in-' + gvrf + '>')}"]
+            vrf = svrf or gvrf
+            if vrf and g["servers"]:
+                problems.append(f"group {gname} points at legacy global-table servers ('server <ip>') while it "
+                                f"uses VRF {vrf}")
+                servers_fix = [f" no {s}" for s in g["servers"]] + \
+                              [f" server-private {first_ip(s) or '<server-ip>'} key <key>" for s in g["servers"]]
         if not problems:
             continue
-        vrf = svrf or gvrf
-        newname = gname if g else "TACACS-VRF"
-        fix = [f"aaa group server tacacs+ {newname}"]
-        fix += [f" no server name {n}" for n, _ in (g["names"] if g else [])]
-        fix += [f" no {s}" for s in (g["servers"] if g else [])]
-        fix += [f" server-private {ip} key <key>" for ip in c.server_ips(g)]
-        fix += [f" ip vrf forwarding {vrf}",
-                f" ip tacacs source-interface {intf if svrf == vrf else '<interface-in-' + vrf + '>'}"]
+        fix = [g["line"] if g else "aaa group server tacacs+ TACACS-VRF"] + servers_fix + vrf_fix
         if g is None:
-            fix.append(f"then point the method lists at 'group {newname}' instead of 'group tacacs+'")
-        why = RULES["L11"][1]
-        if uses_global and not (svrf and svrf != gvrf) and not (gvrf and intf and not svrf):
-            why = ("Older releases reach a TACACS+ server in a VRF only through server-private entries in the "
-                   "group, so 'server name' or global servers here can send nothing back; check on your release.")
+            fix.append("then point the method lists at 'group TACACS-VRF' instead of 'group tacacs+'")
         servers = (g["private"] + [l for _, l in g["names"]] + g["servers"])[:2] if g else c.tac_hosts[:2]
         ev = ([g["line"]] if g else []) + servers + ([g["vrf"][1]] if g and g["vrf"] else []) + \
             ([src[1]] if src else [])
-        add("L11", "high", "TACACS+ VRF mismatch: " + "; ".join(problems), evidence(*ev), fix, why)
+        add("L11", "high", "TACACS+ VRF mismatch: " + "; ".join(problems), evidence(*ev), fix)
 
     # L12: server group forwards into a VRF that is not defined
     for gname, g in c.groups.items():
@@ -483,7 +555,7 @@ def audit_config(name: str, text: str) -> list:
             v = g["vrf"][0]
             add("L12", "high", f"Server group '{gname}' forwards into VRF {v}, which is not defined",
                 evidence(g["line"], g["vrf"][1]),
-                [f"vrf definition {v}", " address-family ipv4", " exit-address-family"])
+                [g["line"], f" ip vrf forwarding {near_or(v, sorted(c.vrfs), '<existing-mgmt-vrf>')}"])
 
     # L13: TACACS+ servers without a key
     if not c.tac_key:
