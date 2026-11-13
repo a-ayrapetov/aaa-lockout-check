@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aaa-lockout-check"
+version = "0.1.0"
+description = "Offline check of Cisco IOS / IOS-XE AAA config: will binding TACACS+ lock you out?"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Arkadiy Ayrapetov" }]
+dependencies = []
+keywords = ["cisco", "ios-xe", "aaa", "tacacs", "radius", "lockout", "audit"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Intended Audience :: System Administrators",
+  "Topic :: System :: Networking",
+  "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/a-ayrapetov/aaa-lockout-check"
+Issues = "https://github.com/a-ayrapetov/aaa-lockout-check/issues"
+
+[project.scripts]
+aaa-lockout-check = "aaa_lockout:main"
+
+[tool.setuptools]
+py-modules = ["aaa_lockout"]
